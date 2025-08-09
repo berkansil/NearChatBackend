@@ -15,5 +15,4 @@
 		<PackageReference Include="Microsoft.AspNetCore.App" />
 		<!-- Add this to support ASP.NET -->
 	</ItemGroup>
-
 </Project>

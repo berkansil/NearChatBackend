@@ -18,7 +18,9 @@ namespace NearChat
         {
 
             Database db = new Database("127.0.0.1", "root", "1234");
-            RestAPI main_api = new RestAPI("http://127.0.0.1:8080/", db);
+            ConnectionManager websocketManager = new(db);
+            db.AddWebsocketManager(websocketManager);
+            RestAPI main_api = new RestAPI("https://127.0.0.1:443/", db, websocketManager);
             main_api.Start();
 
             /*

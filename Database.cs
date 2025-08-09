@@ -27,7 +27,6 @@ namespace NearChatBackend
         Status
     }
 
-    [JsonConverter(typeof(JsonStringEnumConverter))]
     public enum Status
     {
         Online = 1,
@@ -36,7 +35,6 @@ namespace NearChatBackend
         Offline
     }
 
-    [JsonConverter(typeof(JsonStringEnumConverter))]
     public enum ChannelType
     {
         Neighbourhood,
@@ -47,6 +45,8 @@ namespace NearChatBackend
     }
 
     [JsonSerializable(typeof(User))]
+    [JsonSerializable(typeof(Status))]
+    [JsonSourceGenerationOptions(Converters = [typeof(JsonStringEnumConverter)])]
     internal partial class UserSerialisation : JsonSerializerContext
     {
 
@@ -77,6 +77,7 @@ namespace NearChatBackend
     }
 
     [JsonSerializable(typeof(Message))]
+    [JsonSerializable(typeof(List<Message>))]
     internal partial class MessageSerialisation : JsonSerializerContext
     {
 
@@ -106,6 +107,9 @@ namespace NearChatBackend
     }
 
     [JsonSerializable(typeof(Channel))]
+    [JsonSerializable(typeof(List<Channel>))]
+    [JsonSerializable(typeof(ChannelType))]
+    [JsonSourceGenerationOptions(Converters = [typeof(JsonStringEnumConverter)])]
     internal partial class ChannelSerialisation : JsonSerializerContext
     {
          
@@ -131,7 +135,7 @@ namespace NearChatBackend
 
     internal class Database
     {
-
+        private ConnectionManager? websocketManager;
         private string connectionString;
         public Database(string serverIp, string userId, string password)
         {
@@ -145,6 +149,12 @@ namespace NearChatBackend
                 throw new ArgumentException("Cannot connect to database");
             }
         }
+
+        public void AddWebsocketManager(ConnectionManager man)
+        {
+            websocketManager = man;
+        }
+
         static private int GenerateUserId()
         {
             Random rnd = new Random();
@@ -309,13 +319,22 @@ namespace NearChatBackend
             return (string?)GetUserDataFromToken(tokenString, UserTableColumns.Username);
         }
 
-        private bool CanUserAccessChannel(MySqlConnection conection, int userId, int channelId)
+        public bool CanUserAccessChannel(int userId, int channelId)
+        {
+            using MySqlConnection connection = new MySqlConnection(connectionString);
+            connection.Open();
+
+            return CanUserAccessChannel(connection, userId, channelId);
+        }
+
+        bool CanUserAccessChannel(MySqlConnection conection, int userId, int channelId)
         {
             try
             {
                 string permissionQuery = "SELECT EXISTS (SELECT 1 FROM UserChannels WHERE UserId = @UserId AND ChannelId = @ChannelId)";
                 using MySqlCommand permissionCheck = new MySqlCommand(permissionQuery, conection);
                 permissionCheck.Parameters.AddWithValue("@UserId", userId);
+                permissionCheck.Parameters.AddWithValue("@ChannelId", channelId);
 
                 return Convert.ToBoolean(permissionCheck.ExecuteScalar());
             }
@@ -380,14 +399,8 @@ namespace NearChatBackend
             
         }
 
-        public bool UpdateStatus(string token, Status newStatus)
+        public bool UpdateStatus(int userId, Status newStatus)
         {
-            int? userId = GetUserIdFromToken(token);
-            if (!userId.HasValue)
-            {
-                return false;
-            }
-
             using MySqlConnection connection = new MySqlConnection(connectionString);
             connection.Open();
 
@@ -395,7 +408,7 @@ namespace NearChatBackend
             using MySqlCommand cmd = new MySqlCommand(updateQuery, connection);
             cmd.Parameters.AddWithValue("@Status", newStatus);
             cmd.Parameters.AddWithValue("@LastActive", DateTime.UtcNow);
-            cmd.Parameters.AddWithValue("@UserId", userId.Value);
+            cmd.Parameters.AddWithValue("@UserId", userId);
 
             try
             {
@@ -409,6 +422,18 @@ namespace NearChatBackend
             {
                 return false;
             }
+        }
+
+        public bool UpdateStatus(string token, Status newStatus)
+        {
+            int? userId = GetUserIdFromToken(token);
+            if (!userId.HasValue)
+            {
+                return false;
+            }
+
+            return UpdateStatus(userId.Value, newStatus);
+            
         }
 
         public bool UpdateProfilePicture(string token, string url)
@@ -537,7 +562,93 @@ namespace NearChatBackend
 
         }
 
-        public int? CreateChannel(string channelName, ChannelType type)
+        public void UpdateUserChannels(string token, Address addr)
+        {
+            using MySqlConnection connection = new MySqlConnection(connectionString);
+            connection.Open();
+
+            //Remove current channels
+            int? userId = GetUserIdFromToken(token);
+            if (!userId.HasValue)
+            {
+                return; //invalid token
+            }
+
+            string removeQuery = "DELETE FROM UserChannels WHERE UserId = @UserId";
+            using MySqlCommand command = new MySqlCommand(removeQuery, connection);
+            command.Parameters.AddWithValue("@UserId", userId);
+
+            command.ExecuteNonQuery();
+
+            //Join top channel (which must exist)
+            //
+            Channel? ch = GetChannel(addr.very_local);
+            ch ??= CreateChannel(addr.very_local, ChannelType.Local);
+            if (ch == null)
+            {
+                throw new Exception();
+            }
+
+            JoinChannel(token, ch.ChannelId);
+
+            if (addr.neighbourhood != null) 
+            {
+                Channel? chN = GetChannel(addr.neighbourhood);
+                chN ??= CreateChannel(addr.neighbourhood, ChannelType.Neighbourhood);
+
+                if (chN != null)
+                {
+                    JoinChannel(token, chN.ChannelId);
+                }
+            }
+
+            if (addr.city != null)
+            {
+                Channel? chN = GetChannel(addr.city);
+                chN ??= CreateChannel(addr.city, ChannelType.City);
+
+                if (chN != null)
+                {
+                    JoinChannel(token, chN.ChannelId);
+                }
+            }
+
+            if (addr.country != null)
+            {
+                Channel? chN = GetChannel(addr.country);
+                chN ??= CreateChannel(addr.country, ChannelType.Country);
+                if (chN != null)
+                {
+                    JoinChannel(token, chN.ChannelId);
+                }
+            }
+        }
+
+        public Channel? GetChannel(string channelName)
+        {
+            using MySqlConnection connection = new MySqlConnection(connectionString);
+            connection.Open();
+
+            string channelQuery = "SELECT * FROM Channels WHERE Name = @Name";
+            using MySqlCommand command = new MySqlCommand(channelQuery, connection);
+            command.Parameters.AddWithValue("@Name", channelName);
+
+            using MySqlDataReader reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            int id = reader.GetInt32(0);
+            string name = reader.GetString(1);
+            string channelTypeString = reader.GetString(2);
+
+            ChannelType type = Enum.Parse<ChannelType>(channelTypeString);
+
+            return new Channel(id, name, type);
+        }
+
+        public Channel? CreateChannel(string channelName, ChannelType type)
         {
             using MySqlConnection connection = new MySqlConnection(connectionString);
             connection.Open();
@@ -549,12 +660,12 @@ namespace NearChatBackend
                 using MySqlCommand command = new MySqlCommand(channelQuery, connection);
                 command.Parameters.AddWithValue("@ChannelId", channelIdCandidate);
                 command.Parameters.AddWithValue("@Name", channelName);
-                command.Parameters.AddWithValue("@ChannelType", type);
+                command.Parameters.AddWithValue("@ChannelType", type.ToString());
 
                 try
                 {
                     command.ExecuteNonQuery();
-                    return channelIdCandidate;
+                    return new Channel(channelIdCandidate, channelName, type);
                 } catch(MySqlException ex)
                 {
                     if (ex.Number == 1062) // Duplicate entry error
@@ -567,6 +678,7 @@ namespace NearChatBackend
                             continue;
                         }
                     }
+                    throw;
                     return null;
                 }
             }
@@ -606,11 +718,12 @@ namespace NearChatBackend
             using MySqlCommand command = new MySqlCommand(authQuery, connection);
             command.Parameters.AddWithValue("@Username", username);
 
-            using MySqlDataReader reader = command.ExecuteReader();
+            MySqlDataReader reader = command.ExecuteReader();
             if (reader == null || !reader.Read())
             {
                 throw new ArgumentException("Invalid credentials");
             }
+            
 
             byte[] passwordHash = new byte[60];
             reader.GetBytes(0, 0, passwordHash, 0, 60);
@@ -625,24 +738,30 @@ namespace NearChatBackend
                 throw new ArgumentException("Invalid credentials");
             }
 
+            reader.Close();
+
             //Generate and add the token
             string? token = GenerateAndAddToken(connection, userId);
             if (token == null)
             {
-                throw new Exception();
+                throw new Exception("Failed to generate token");
             }
             return token;
 
         }
 
-        public bool Logout(string token)
+        public bool Logout(string tokenString)
         {
             using MySqlConnection connection = new MySqlConnection(connectionString);
             connection.Open();
 
             string deleteQuery = "DELETE FROM Tokens WHERE Token = @Token";
+
+            byte[] token = Convert.FromBase64String(tokenString);
+            string sha256Token = Convert.ToBase64String(SHA256.HashData(token));
+
             using MySqlCommand command = new MySqlCommand(deleteQuery, connection);
-            command.Parameters.AddWithValue("@Username", token);
+            command.Parameters.AddWithValue("@Token", sha256Token);
 
             if (command.ExecuteNonQuery() >= 1)
             {
@@ -720,7 +839,7 @@ namespace NearChatBackend
                 string content = rdr.GetString(1);
                 DateTime msgTimestamp = rdr.GetDateTime(2);
                 int authorId = rdr.GetInt32(3);
-                int? replyingMessageId = rdr.GetInt32(4);
+                int? replyingMessageId = rdr.IsDBNull(4) ? null : rdr.GetInt32(4);
 
                 messages.Add(new Message(msgId, content, msgTimestamp, authorId, replyingMessageId, channelId));
             }
@@ -729,7 +848,7 @@ namespace NearChatBackend
 
         }
 
-        public bool DeleteMessage(string token, int messageId)
+        public void DeleteMessage(string token, int messageId)
         {
             using MySqlConnection connection = new(connectionString);
             connection.Open();
@@ -739,7 +858,7 @@ namespace NearChatBackend
 
             if (!requesterId.HasValue)
             {
-                return false;
+                throw new AuthenticationException("Invalid token");
             }
 
             //Get the AuthorId and ChannelId matching the message from the database
@@ -750,7 +869,7 @@ namespace NearChatBackend
             using MySqlDataReader rdr = getChannel.ExecuteReader();
             if (!rdr.Read()) //If there is no matching message
             {
-                return false;
+                throw new ArgumentException("Message not found");
             }
 
             int authorId = rdr.GetInt32(0);
@@ -759,8 +878,9 @@ namespace NearChatBackend
             //Check that the authorId matches the requesterId
             if (authorId != requesterId)
             {
-                return false;
+                throw new SecurityException("No permission to delete message");
             }
+            rdr.Close();
 
             //Delete the message
             string deleteQuery = "DELETE FROM Messages WHERE MessageId = @MessageId";
@@ -769,23 +889,22 @@ namespace NearChatBackend
 
             if (command.ExecuteNonQuery() == 0)
             {
-                return false;
+                throw new ArgumentException("Message not found");
             }
-            Websocket.DeleteMessageInChannel(channelId, messageId);
-            return true;
+            websocketManager?.DeleteMessage(messageId, channelId);
         }
 
-        public bool SendMessage(string token, string message, int channelId, int? parentId)
+        public void SendMessage(string token, string message, int channelId, int? parentId)
         {
             if (message == null || message.Length == 0 || message.Length > 4096)
             {
-                return false;
+                throw new ArgumentException("Invalid message content");
             }
 
             int? userId = GetUserIdFromToken(token);
             if (userId == null)
             {
-                return false;
+                throw new AuthenticationException("Invalid token");
             }
 
             using MySqlConnection connection = new(connectionString);
@@ -793,7 +912,7 @@ namespace NearChatBackend
 
             if (!CanUserAccessChannel(connection, userId.Value, channelId))
             {
-                return false;
+                throw new SecurityException("Cannot access channel");
             }
 
             int messageIdCandidate = GenerateMessageId();
@@ -814,8 +933,9 @@ namespace NearChatBackend
                     command.Parameters.AddWithValue("@ChannelId", channelId);
 
                     command.ExecuteNonQuery();
-                    Websocket.SendMessageToChannel(channelId, new Websocket.Message(messageIdCandidate, message, time, (int)userId, channelId, parentId));
-                    return true;
+
+                    websocketManager?.SendMessage(new Message(messageIdCandidate, message, time, userId.Value, parentId, channelId), channelId);
+                    return;
                 }
                 catch (MySqlException ex)
                 {
@@ -829,7 +949,7 @@ namespace NearChatBackend
                             continue;
                         }
                     }
-                    return false;
+                    throw;
                 }
             }
         }
